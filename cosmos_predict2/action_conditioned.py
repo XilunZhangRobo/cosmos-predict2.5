@@ -125,6 +125,7 @@ def get_action_sequence_from_states(
     actions *= np.array(
         [action_scaler, action_scaler, action_scaler, action_scaler, action_scaler, action_scaler, gripper_scale]
     )
+    # actions = np.array((actions) + np.random.normal(0.1, 0.1, actions.shape))
 
     return actions
 
