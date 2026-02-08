@@ -16,11 +16,11 @@ class MBPlanningArguments(ActionConditionedInferenceArguments):
     """Arguments for model-based planning: same as action-conditioned inference plus CEM params."""
 
     # CEM planning
-    cem_iterations: int = 10
+    cem_iterations: int = 8
     """Number of Cross-Entropy Method iterations."""
-    num_samples: int = 32
+    num_samples: int = 16
     """Number of action-sequence samples per CEM iteration."""
-    num_elite: int = 16
+    num_elite: int = 8
     """Number of elite samples to refit the distribution."""
     action_std_init: float = 0.33
     """Initial std for action sampling (scaled space). Run action_conditioned_check_action_range.py to get from data."""
@@ -28,8 +28,8 @@ class MBPlanningArguments(ActionConditionedInferenceArguments):
     """Lower bound for clipping actions (scaled space). Run action_conditioned_check_action_range.py to get from data."""
     action_bounds_high: float = 6.0
     """Upper bound for clipping actions (scaled space). Run action_conditioned_check_action_range.py to get from data."""
-    cost_type: str = "mse"
-    """Cost to goal image: 'mse' or 'l1'."""
+    cost_type: str = "feature_l1"
+    """Cost to goal image: 'mse', 'l1', or 'feature_l1' (L1 in encoder feature space, recommended)."""
 
 
 MBPlanningOverrides = get_overrides_cls(MBPlanningArguments, exclude=["name"])
