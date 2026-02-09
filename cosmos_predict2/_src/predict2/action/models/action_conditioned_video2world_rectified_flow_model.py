@@ -18,11 +18,9 @@ from typing import Callable, Dict, Optional, Tuple
 
 import attrs
 import torch
-import tqdm
 from megatron.core import parallel_state
 from torch import Tensor
 
-from cosmos_predict2._src.imaginaire.flags import INTERNAL
 from cosmos_predict2._src.imaginaire.utils import misc
 from cosmos_predict2._src.imaginaire.utils.context_parallel import broadcast_split_tensor, cat_outputs_cp
 from cosmos_predict2._src.predict2.conditioner import DataType
@@ -143,10 +141,7 @@ class ActionVideo2WorldModelRectifiedFlow(Text2WorldModelRectifiedFlow):
         latents = noise
 
         latent_to_save = {}
-        if INTERNAL:
-            timesteps_iter = timesteps
-        else:
-            timesteps_iter = tqdm.tqdm(timesteps, desc="Generating samples", total=len(timesteps))
+        timesteps_iter = timesteps
 
         for num_step, t in enumerate(timesteps_iter):
             if num_step in query_steps:

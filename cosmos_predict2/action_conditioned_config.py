@@ -57,7 +57,7 @@ class ActionConditionedInferenceArguments(CommonInferenceArguments):
     save_root: Path = Path("results/action2world")
     """Save root directory."""
     # Model parameters
-    chunk_size: int = 12
+    chunk_size: int = 4
     """Chunk size for action conditioning."""
     guidance: Guidance = 7
     """Guidance value."""

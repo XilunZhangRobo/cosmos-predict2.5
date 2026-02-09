@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from glob import glob
 
 import mediapy
@@ -198,6 +199,7 @@ def cross_entropy_plan(
     negative_prompt: str | None = None,
     seed_base: int = 0,
     progress: bool = True,
+    episode_bar: tqdm | None = None,
 ) -> tuple[np.ndarray, list[float], dict]:
     """
     Cross-Entropy Method (CEM) to plan an action sequence that minimizes
@@ -221,7 +223,8 @@ def cross_entropy_plan(
         cost_type: "mse", "l1", or "feature_l1" (L1 in encoder feature space) for goal_image_cost.
         prompt, guidance, resolution, negative_prompt: World model kwargs.
         seed_base: Base seed for rollout (each sample gets seed_base + sample_idx).
-        progress: If True, show tqdm progress bar and loss after each iteration.
+        progress: If True, show loss updates.
+        episode_bar: If provided, update its postfix with CEM iter and losses (single episode bar).
 
     Returns:
         best_actions: (chunk_size, action_dim) best action sequence found.
@@ -236,20 +239,13 @@ def cross_entropy_plan(
     action_std_mean_per_iter: list[float] = []  # mean(std) over action dims, to see convergence
     all_costs_last_iter: list[float] = []  # cost of every sample on last iter (for distribution)
 
-    iter_range = range(cem_iterations)
-    if progress:
-        iter_range = tqdm(iter_range, desc="CEM", unit="iter")
-
-    for it in iter_range:
+    for it in range(cem_iterations):
         # Sample
         samples = np.random.normal(mean, std, size=(num_samples,) + action_shape)
         samples = np.clip(samples, action_bounds_low, action_bounds_high).astype(np.float32)
 
         costs = np.full(num_samples, np.inf, dtype=np.float64)
-        sample_range = range(num_samples)
-        if progress:
-            sample_range = tqdm(sample_range, desc="  rollouts", leave=False, unit="sample")
-        for k in sample_range:
+        for k in range(num_samples):
             try:
                 _, last_frame = rollout_world_model(
                     video2world_cli,
@@ -285,16 +281,10 @@ def cross_entropy_plan(
         if it == cem_iterations - 1:
             all_costs_last_iter = costs.tolist()
 
-        if progress and hasattr(iter_range, "set_postfix"):
-            iter_range.set_postfix(
-                elite_loss=f"{elite_mean:.5f}",
-                best_loss=f"{best_cost:.5f}",
+        if episode_bar is not None:
+            episode_bar.set_postfix_str(
+                f"CEM {it + 1}/{cem_iterations} | elite={elite_mean:.4f} best={best_cost:.4f}",
                 refresh=True,
-            )
-        # Print loss on its own line so it stays visible (not scrolled away by nested bars)
-        if progress:
-            tqdm.write(
-                f"CEM iter {it + 1}/{cem_iterations}  elite_loss={elite_mean:.6f}  best_loss={best_cost:.6f}"
             )
         logger.info(
             f"CEM iter {it + 1}/{cem_iterations} "
@@ -320,8 +310,9 @@ def cross_entropy_plan(
 def run_planning_inference(setup_args, planning_args):
     """
     Run model-based planning: for each input video, use first frame as initial state,
-    last frame as goal image. At each step we plan an action sequence with CEM, execute
-    only the first action, observe the new (predicted) state, and replan (receding-horizon).
+    last frame as goal image. For each chunk we plan an action sequence of length
+    planning_horizon with CEM, execute the first chunk_size actions, observe the
+    new (predicted) state, and replan (receding-horizon).
 
     Uses the same setup as action_conditioned (checkpoint, config) and the same
     input layout (input_root, input_json_sub_folder, camera_id, etc.).
@@ -391,12 +382,13 @@ def run_planning_inference(setup_args, planning_args):
             except Exception as e:
                 logger.warning(f"Resize failed: {e}")
 
-        # Get action length from demo to determine number of steps (execute first action only per plan)
+        # Get action length from demo to determine number of chunks
         action_data = action_load_fn_factory()(json_data, video_path, planning_args)
         num_actions = len(action_data["actions"])
+        num_chunks = (num_actions + planning_args.chunk_size - 1) // planning_args.chunk_size
         logger.info(
-            f"Demo has {num_actions} actions; planning horizon={planning_args.chunk_size}, "
-            "execute first action only then replan (receding-horizon)"
+            f"Demo has {num_actions} actions → {num_chunks} chunk(s); "
+            f"planning horizon={planning_args.planning_horizon}, execute chunk_size={planning_args.chunk_size} per replan"
         )
 
         img_name = os.path.basename(annotation_path).replace(".json", "")
@@ -405,19 +397,40 @@ def run_planning_inference(setup_args, planning_args):
             logger.info(f"Planned video already exists: {out_path}")
             continue
 
-        chunk_metrics_list = []  # per-step CEM metrics for tracking
+        chunk_videos = []
+        chunk_metrics_list = []  # per-chunk CEM metrics for tracking
         current_initial = initial_frame
-        # Build video: first frame, then one new frame per executed action
-        full_video_list = [current_initial]
-        for step_idx in range(num_actions):
+
+        chunk_iter = (
+            tqdm(
+                range(num_chunks),
+                desc=f"Episode {img_name}",
+                unit="chunk",
+                total=num_chunks,
+            )
+            if rank0
+            else range(num_chunks)
+        )
+        episode_start_time = time.perf_counter()
+        for chunk_idx in chunk_iter:
+            # Goal for this chunk = demo frame at end of planning horizon (waypoint)
+            goal_frame_idx = min((chunk_idx + 1) * planning_args.planning_horizon, len(video_array) - 1)
+            goal_image_chunk = video_array[goal_frame_idx]
+            if planning_args.resolution != "none":
+                try:
+                    h, w = map(int, planning_args.resolution.split(","))
+                    goal_image_chunk = mediapy.resize_image(goal_image_chunk, (h, w))
+                except Exception:
+                    pass
             logger.info(
-                f"Planning for {img_name} step {step_idx + 1}/{num_actions} (goal = final frame)"
+                f"Planning for {img_name} chunk {chunk_idx + 1}/{num_chunks} "
+                f"(goal = demo frame {goal_frame_idx})"
             )
             best_actions, elite_costs, cem_metrics = cross_entropy_plan(
                 current_initial,
-                goal_image,
+                goal_image_chunk,
                 video2world_cli,
-                chunk_size=planning_args.chunk_size,
+                chunk_size=planning_args.planning_horizon,
                 action_dim=action_dim,
                 cem_iterations=planning_args.cem_iterations,
                 num_samples=planning_args.num_samples,
@@ -431,39 +444,59 @@ def run_planning_inference(setup_args, planning_args):
                 num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
                 resolution=planning_args.resolution,
                 negative_prompt=planning_args.negative_prompt,
-                seed_base=planning_args.seed + step_idx * 10000,
+                seed_base=planning_args.seed + chunk_idx * 10000,
                 progress=True,
+                episode_bar=chunk_iter if rank0 and hasattr(chunk_iter, "set_postfix") else None,
             )
             chunk_metrics_list.append({
-                "step_idx": step_idx,
+                "chunk_idx": chunk_idx,
+                "goal_frame_idx": int(goal_frame_idx),
                 **cem_metrics,
             })
-            # Execute only the first action, then replan
-            first_action = best_actions[0:1]
+            # Execute first chunk_size actions from the planned sequence, then replan
+            actions_to_execute = best_actions[0 : planning_args.chunk_size]
             video_frames, last_frame = rollout_world_model(
                 video2world_cli,
                 current_initial,
-                first_action,
+                actions_to_execute,
                 prompt=planning_args.prompt or "",
                 guidance=planning_args.guidance,
                 num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
                 resolution=planning_args.resolution,
                 negative_prompt=planning_args.negative_prompt,
-                seed=planning_args.seed + 9999 + step_idx * 10000,
+                seed=planning_args.seed + 9999 + chunk_idx * 10000,
             )
-            full_video_list.append(last_frame)
+            chunk_videos.append(video_frames)
             current_initial = last_frame
 
-        full_video = np.stack(full_video_list, axis=0)
+            if rank0 and chunk_idx == 0 and num_chunks > 1:
+                # After first chunk, write estimated episode completion time
+                elapsed = time.perf_counter() - episode_start_time
+                if elapsed > 0:
+                    est_total = elapsed * num_chunks
+                    est_remaining = est_total - elapsed
+                    tqdm.write(
+                        f"  Est. episode total: ~{est_total / 60:.1f} min | "
+                        f"remaining: ~{est_remaining / 60:.1f} min"
+                    )
+
+        # Concatenate: first chunk full, later chunks skip first frame to avoid duplicate
+        if len(chunk_videos) == 1:
+            full_video = chunk_videos[0]
+        else:
+            full_video = np.concatenate(
+                [chunk_videos[0]] + [chunk_videos[i][1:] for i in range(1, len(chunk_videos))],
+                axis=0,
+            )
         if rank0:
             out_path_str = str(out_path.resolve())
             try:
                 mediapy.write_video(out_path_str, full_video, fps=planning_args.save_fps)
                 tqdm.write(
-                    f"Saved planned video to {out_path_str} ({num_actions} steps, {len(full_video)} frames)"
+                    f"Saved planned video to {out_path_str} ({num_chunks} chunks, {len(full_video)} frames)"
                 )
                 logger.info(
-                    f"Saved planned video to {out_path_str} ({num_actions} steps, final elite cost: {chunk_metrics_list[-1]['final_elite_mean']:.6f})"
+                    f"Saved planned video to {out_path_str} ({num_chunks} chunks, final elite cost: {chunk_metrics_list[-1]['final_elite_mean']:.6f})"
                 )
             except Exception as e:
                 logger.exception(f"Failed to save video to {out_path_str}: {e}")
@@ -475,10 +508,11 @@ def run_planning_inference(setup_args, planning_args):
                 stats = {
                     "img_name": img_name,
                     "num_actions": int(num_actions),
+                    "planning_horizon": int(planning_args.planning_horizon),
                     "chunk_size": int(planning_args.chunk_size),
+                    "num_chunks": int(num_chunks),
                     "num_frames_planned": int(len(full_video)),
-                    "execute_first_action_only": True,
-                    "steps": chunk_metrics_list,
+                    "chunks": chunk_metrics_list,
                 }
                 with open(stats_path, "w") as f:
                     json.dump(stats, f, indent=2)

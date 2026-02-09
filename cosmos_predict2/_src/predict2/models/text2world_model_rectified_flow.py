@@ -567,10 +567,7 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
                 noise = rearrange(noise, "b c (t h w) -> b c t h w", t=after_split_shape[0], h=after_split_shape[1])
         latents = noise
 
-        if INTERNAL:
-            timesteps_iter = timesteps
-        else:
-            timesteps_iter = tqdm.tqdm(timesteps, desc="Generating samples", total=len(timesteps))
+        timesteps_iter = timesteps
 
         for _, t in enumerate(timesteps_iter):
             latent_model_input = latents
@@ -677,10 +674,7 @@ class Text2WorldModelRectifiedFlow(ImaginaireModel):
                 noise = rearrange(noise, "b c (t h w) -> b c t h w", t=after_split_shape[0], h=after_split_shape[1])
         latents = noise
 
-        if INTERNAL:
-            timesteps_iter = timesteps
-        else:
-            timesteps_iter = tqdm.tqdm(timesteps, desc="Generating samples", total=len(timesteps))
+        timesteps_iter = timesteps
 
         lora_disabled = False
         if adapter_switch_timesteps:

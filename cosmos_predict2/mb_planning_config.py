@@ -16,6 +16,8 @@ class MBPlanningArguments(ActionConditionedInferenceArguments):
     """Arguments for model-based planning: same as action-conditioned inference plus CEM params."""
 
     # CEM planning
+    planning_horizon: int = 12
+    """Number of action steps to optimize for during CEM. The planned sequence length."""
     cem_iterations: int = 8
     """Number of Cross-Entropy Method iterations."""
     num_samples: int = 16
