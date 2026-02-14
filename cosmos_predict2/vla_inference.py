@@ -8,20 +8,29 @@
 #
 # Required when use_vla_actions=True: Add the following to your PYTHONPATH:
 #   - Path to lerobot (for PI0Policy)
-#   - Path to CoVer_VLA/inference (for create_bridge_adapter_wrapper from eval_utils)
-#   - Path to INT-ACT (for BridgeSimplerAdapter)
+#   - Path to INT-ACT (for BridgeSimplerAdapter; create_bridge_adapter_wrapper is in cosmos)
 #
-# Example: export PYTHONPATH="${VLA_CLIP_ROOT}:${VLA_CLIP_ROOT}/lerobot_custom:${VLA_CLIP_ROOT}/INT-ACT:$PYTHONPATH"
+# Example: export PYTHONPATH="${VLA_CLIP_ROOT}/lerobot_custom:${VLA_CLIP_ROOT}/INT-ACT:$PYTHONPATH"
 #
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Optional
 
 import numpy as np
 import torch
 
 from loguru import logger
+
+# Ensure VLA paths are in sys.path (VLA_CLIP_ROOT set by run_action_planning_vla.sh)
+_VLA_CLIP_ROOT = os.environ.get("VLA_CLIP_ROOT")
+if _VLA_CLIP_ROOT:
+    for subpath in ("lerobot_custom", "INT-ACT"):
+        path = os.path.join(_VLA_CLIP_ROOT, subpath)
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def _ensure_vla_deps():
@@ -34,13 +43,7 @@ def _ensure_vla_deps():
             "Add lerobot to PYTHONPATH, e.g.: export PYTHONPATH=\"${VLA_CLIP_ROOT}/lerobot_custom:$PYTHONPATH\""
         ) from e
 
-    try:
-        from experiments.robot.simpler.eval_utils import create_bridge_adapter_wrapper
-    except ImportError as e:
-        raise ImportError(
-            "VLA inference requires CoVer_VLA eval_utils (create_bridge_adapter_wrapper). "
-            "Run from CoVer_VLA/inference or add it to PYTHONPATH."
-        ) from e
+    from cosmos_predict2.vla_bridge_adapter import create_bridge_adapter_wrapper
 
     return PI0Policy, create_bridge_adapter_wrapper
 
@@ -89,6 +92,75 @@ def load_vla_policy(
     return pi0_policy, preprocess_adapter
 
 
+def vla_to_dataset_actions(
+    bridge_actions: np.ndarray,
+    state_at_chunk_start: np.ndarray,
+) -> np.ndarray:
+    """Step 1: Convert VLA (Bridge format) to original dataset format.
+
+    Bridge/VLA outputs [world_vector (3), rotation_delta (3), gripper (1)] in world frame.
+    Dataset stores body-frame [rel_xyz, rel_rpy, gripper] unscaled (same as _get_actions output).
+
+    Returns actions in dataset format: body-frame deltas, physical units, unscaled.
+    """
+    return _bridge_to_cosmos_actions(bridge_actions, state_at_chunk_start)
+
+
+def dataset_to_world_model_actions(
+    dataset_actions: np.ndarray,
+    action_scaler: float = 20.0,
+    gripper_scale: float = 1.0,
+) -> np.ndarray:
+    """Step 2: Convert dataset format to world model format.
+
+    Dataset = body-frame unscaled (from _get_actions or vla_to_dataset_actions).
+    World model = same * [action_scaler, ..., gripper_scale] (same as get_action_sequence_from_states).
+    """
+    scale = np.array(
+        [action_scaler, action_scaler, action_scaler, action_scaler, action_scaler, action_scaler, gripper_scale],
+        dtype=np.float32,
+    )
+    return (dataset_actions.astype(np.float32) * scale).astype(np.float32)
+
+
+def _bridge_to_cosmos_actions(
+    bridge_actions: np.ndarray,
+    state_at_chunk_start: np.ndarray,
+) -> np.ndarray:
+    """Convert Bridge (world-frame xyz) to dataset format (body-frame, unscaled).
+
+    Bridge outputs [world_vector (3), rotation_delta (3), gripper (1)] in world frame.
+    Dataset expects [rel_xyz (3), rel_rpy (3), gripper (1)] with rel_xyz = R.T @ world_vector.
+
+    Propagates state through the chunk to convert each action correctly.
+    """
+    from cosmos_predict2._src.predict2.action.datasets.dataset_utils import euler2rotm, rotm2euler
+
+    actions_cosmos = np.zeros_like(bridge_actions, dtype=np.float32)
+    xyz = state_at_chunk_start[:3].astype(np.float64)
+    rpy = state_at_chunk_start[3:6].astype(np.float64)
+    R = euler2rotm(rpy)
+
+    for t in range(bridge_actions.shape[0]):
+        world_xyz = bridge_actions[t, :3]
+        rot_delta = bridge_actions[t, 3:6]
+        gripper = bridge_actions[t, 6]
+
+        # Convert xyz: world -> body
+        body_xyz = R.T @ world_xyz
+        actions_cosmos[t, :3] = body_xyz
+        actions_cosmos[t, 3:6] = rot_delta  # Assume rotation_delta is body-frame (common)
+        actions_cosmos[t, 6] = gripper
+
+        # Propagate state for next action
+        xyz = xyz + world_xyz
+        rel_rotm = euler2rotm(rot_delta)
+        R = R @ rel_rotm
+        rpy = rotm2euler(R)
+
+    return actions_cosmos
+
+
 def generate_vla_actions(
     initial_frame: np.ndarray,
     task_instruction: str,
@@ -101,6 +173,7 @@ def generate_vla_actions(
     action_noise_std: float = 1.0,
     action_scaler: float = 20.0,
     gripper_scale: float = 1.0,
+    convert_bridge_to_cosmos: bool = True,
 ) -> np.ndarray:
     """Generate a chunk of actions from the VLA model given initial frame and task.
 
@@ -119,6 +192,10 @@ def generate_vla_actions(
 
     Returns:
         actions: (n_action_steps, 7) in cosmos world model format (scaled deltas).
+
+    Pipeline when convert_bridge_to_cosmos=True:
+        1. VLA (Bridge format, world-frame) -> vla_to_dataset_actions -> dataset format (body unscaled)
+        2. dataset format -> dataset_to_world_model_actions -> world model format (body * action_scaler)
     """
     policy_device = torch.device(pi0_policy.config.device)
     n_action_steps = pi0_policy.config.n_action_steps
@@ -175,13 +252,20 @@ def generate_vla_actions(
     # Stack: (n_action_steps, 7) - raw model output (normalized in [-1,1])
     actions_np = np.concatenate(actions_list, axis=0)
 
-    # Denormalize to Bridge delta space, then scale for cosmos world model
+    # Denormalize to Bridge delta space (physical units)
     raw_bridge = _denormalize_bridge_actions(actions_np, preprocess_adapter)
-    scale = np.array(
-        [action_scaler, action_scaler, action_scaler, action_scaler, action_scaler, action_scaler, gripper_scale],
-        dtype=np.float32,
+
+    # Two-step conversion: VLA -> dataset format -> world model format
+    if convert_bridge_to_cosmos and state is not None:
+        # Step 1: Bridge (world-frame) -> dataset (body-frame, unscaled)
+        dataset_actions = vla_to_dataset_actions(raw_bridge, state)
+    else:
+        dataset_actions = raw_bridge
+
+    # Step 2: dataset -> world model (same scaling as get_action_sequence_from_states)
+    return dataset_to_world_model_actions(
+        dataset_actions, action_scaler=action_scaler, gripper_scale=gripper_scale
     )
-    return (raw_bridge * scale).astype(np.float32)
 
 
 def _denormalize_bridge_actions(actions_normalized: np.ndarray, adapter) -> np.ndarray:

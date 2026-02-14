@@ -49,5 +49,24 @@ class MBPlanningArguments(ActionConditionedInferenceArguments):
     task_instruction: str | None = None
     """Override task instruction for VLA. If None, uses json_data['texts'][0] or ['task']."""
 
+    # Multi-GPU: put VLA and world model on different GPUs when both don't fit on one
+    world_model_device: str = "cuda:0"
+    """Device for world model. Set vla_device=cuda:1 to put VLA on a different GPU."""
+    vla_device: str = "cuda:0"
+    """Device for VLA policy. Set world_model_device=cuda:0, vla_device=cuda:1 to split across 2 GPUs."""
+
+    convert_bridge_to_cosmos: bool = True
+    """Convert VLA xyz from Bridge (world-frame) to Cosmos (body-frame). Run scripts/verify_action_alignment.py to check."""
+
+    # Replan conditioning: GT frame vs generated frame
+    use_gt_frames_for_replan: bool = True
+    """If True, use ground-truth demo frame every N steps for next chunk; if False, use world-model generated frame."""
+    save_both_versions: bool = False
+    """If True, save two videos: _planned.mp4 (full video including GT at chunk boundaries) and
+    _planned_no_gt.mp4 (same rollout, but skip GT frames when saving - output has only generated frames)."""
+    save_three_versions: bool = False
+    """If True, save three videos: _planned.mp4, _planned_no_gt.mp4, and _planned_generated_vla.mp4.
+    The third uses world-model generated frames as VLA input (preprocessed via Bridge adapter)."""
+
 
 MBPlanningOverrides = get_overrides_cls(MBPlanningArguments, exclude=["name"])

@@ -21,7 +21,8 @@ if [[ ! -d "$VLA_CLIP_ROOT" ]]; then
   exit 1
 fi
 
-export PYTHONPATH="${VLA_CLIP_ROOT}/CoVer_VLA/inference:${VLA_CLIP_ROOT}/lerobot_custom:${VLA_CLIP_ROOT}/INT-ACT:${PYTHONPATH:-}"
+export VLA_CLIP_ROOT
+export PYTHONPATH="${VLA_CLIP_ROOT}/lerobot_custom:${VLA_CLIP_ROOT}/INT-ACT:${PYTHONPATH:-}"
 
 cd "$SCRIPT_DIR"
 
@@ -30,8 +31,11 @@ echo "  VLA_CLIP_ROOT=$VLA_CLIP_ROOT"
 echo "  Config: assets/action_conditioned/basic/planning_params_vla.json"
 echo ""
 
-# Use --extra cu128 for compatible torch 2.7 + transformer_engine (avoids ABI mismatch)
+# Multi-GPU: if VLA + world model don't fit on one GPU, set in JSON or via overrides:
+#   world_model_device=cuda:0  vla_device=cuda:1
+#
+# Use --extra cu128 for compatible torch 2.7; --extra vla for lerobot/PI0 deps
 # -o/--output-dir is required (logs, config; planned videos go to save_root in the JSON)
-uv run --extra cu128 python examples/action_conditioned_planning.py \
+uv run --extra cu128 --extra vla python examples/action_conditioned_planning.py \
   -i assets/action_conditioned/basic/planning_params_vla.json \
   -o outputs/action_conditioned/basic_vla

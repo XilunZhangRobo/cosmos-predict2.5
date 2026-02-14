@@ -88,8 +88,9 @@ def rollout_world_model(
     vid_input = vid_input.unsqueeze(0).permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
 
     action_tensor = torch.from_numpy(actions_chunk).float()
-    if action_tensor.device.type != "cuda":
-        action_tensor = action_tensor.cuda()
+    wm_device = getattr(video2world_cli, "device", "cuda:0")
+    if str(action_tensor.device) != wm_device:
+        action_tensor = action_tensor.to(wm_device)
 
     video = video2world_cli.generate_vid2world(
         prompt=prompt,
@@ -348,6 +349,7 @@ def run_planning_inference(setup_args, planning_args):
         s3_credential_path="",
         context_parallel_size=setup_args.context_parallel_size,
         config_file=setup_args.config_file,
+        device=planning_args.world_model_device,
     )
     logger.info("World model loaded.")
 
@@ -380,6 +382,7 @@ def run_planning_inference(setup_args, planning_args):
                 planning_args.vla_checkpoint,
                 n_action_steps=planning_args.vla_n_action_steps,
                 action_ensemble_temp=planning_args.vla_action_ensemble_temp,
+                device=planning_args.vla_device,
             )
             logger.info("VLA policy loaded.")
         except ImportError as e:
@@ -406,6 +409,7 @@ def run_planning_inference(setup_args, planning_args):
             video_path = str(input_video_path / json_data["videos"][camera_id])
 
         video_array = mediapy.read_video(video_path)
+        video_array_original = video_array  # Keep original resolution for VLA (Bridge expects this)
         initial_frame = video_array[0]
         goal_image = video_array[-1]
         if planning_args.resolution != "none":
@@ -431,14 +435,33 @@ def run_planning_inference(setup_args, planning_args):
         )
 
         img_name = os.path.basename(annotation_path).replace(".json", "")
-        out_path = save_root / f"{img_name}_planned.mp4"
-        if out_path.exists():
-            logger.info(f"Planned video already exists: {out_path}")
-            continue
+        save_both = planning_args.save_both_versions
+        save_three = planning_args.save_three_versions
+        if save_three or save_both:
+            out_path_gt = save_root / f"{img_name}_planned.mp4"
+            out_path_no_gt = save_root / f"{img_name}_planned_no_gt.mp4"
+            out_path_gen_vla = save_root / f"{img_name}_planned_generated_vla.mp4" if save_three else None
+            all_exist = out_path_gt.exists() and out_path_no_gt.exists()
+            if save_three and out_path_gen_vla is not None:
+                all_exist = all_exist and out_path_gen_vla.exists()
+            if all_exist:
+                logger.info(f"All planned videos already exist for {img_name}")
+                continue
+        else:
+            out_path = save_root / f"{img_name}_planned.mp4"
+            if out_path.exists():
+                logger.info(f"Planned video already exists: {out_path}")
+                continue
 
-        chunk_videos = []
+        chunk_videos = []  # rollout from GT at boundaries (VLA on GT)
+        chunk_videos_gen = [] if save_three else None  # rollout from generated (VLA on world-model output)
         chunk_metrics_list = []  # per-chunk CEM metrics for tracking
-        current_initial = initial_frame
+        # VLA on GT: use original-resolution frames (Bridge adapter resizes to 224x224)
+        current_initial_vla = video_array_original[0]
+        # World model: use resized frames (256x320)
+        current_initial_rollout = initial_frame
+        # VLA on generated: world-model output as next input (preprocessed by Bridge adapter in generate_vla_actions)
+        current_initial_gen = initial_frame if save_three else None
 
         chunk_iter = (
             tqdm(
@@ -464,157 +487,233 @@ def run_planning_inference(setup_args, planning_args):
             logger.info(f"VLA task instruction: {task_instruction}")
 
         for chunk_idx in chunk_iter:
-            # Goal for this chunk = demo frame at end of planning horizon (waypoint)
-            goal_frame_idx = min((chunk_idx + 1) * planning_args.planning_horizon, len(video_array) - 1)
-            goal_image_chunk = video_array[goal_frame_idx]
-            if planning_args.resolution != "none":
-                try:
-                    h, w = map(int, planning_args.resolution.split(","))
-                    goal_image_chunk = mediapy.resize_image(goal_image_chunk, (h, w))
-                except Exception:
-                    pass
-            logger.info(
-                f"{'VLA' if planning_args.use_vla_actions else 'Planning'} for {img_name} chunk {chunk_idx + 1}/{num_chunks} "
-                f"(goal = demo frame {goal_frame_idx})"
-            )
+                # Goal for this chunk = demo frame at end of planning horizon (waypoint)
+                goal_frame_idx = min((chunk_idx + 1) * planning_args.planning_horizon, len(video_array) - 1)
+                goal_image_chunk = video_array[goal_frame_idx]
+                if planning_args.resolution != "none":
+                    try:
+                        h, w = map(int, planning_args.resolution.split(","))
+                        goal_image_chunk = mediapy.resize_image(goal_image_chunk, (h, w))
+                    except Exception:
+                        pass
+                logger.info(
+                    f"{'VLA' if planning_args.use_vla_actions else 'Planning'} for {img_name} chunk {chunk_idx + 1}/{num_chunks} "
+                    f"(goal = demo frame {goal_frame_idx})"
+                )
 
-            if planning_args.use_vla_actions:
-                # Generate actions from VLA model
-                frame_idx = chunk_idx * effective_chunk_size
-                state, gripper = get_initial_state_from_json(
-                    json_data,
-                    frame_idx=frame_idx,
-                    state_key=planning_args.state_key,
-                    gripper_key=planning_args.gripper_key,
+                if planning_args.use_vla_actions:
+                    # Generate actions from VLA model (conditioned on GT or generated)
+                    frame_idx = chunk_idx * effective_chunk_size
+                    state, gripper = get_initial_state_from_json(
+                        json_data,
+                        frame_idx=frame_idx,
+                        state_key=planning_args.state_key,
+                        gripper_key=planning_args.gripper_key,
+                    )
+                    vla_cond = current_initial_vla if planning_args.use_gt_frames_for_replan else current_initial_rollout
+                    best_actions = generate_vla_actions(
+                        vla_cond,
+                        task_instruction,
+                        vla_policy,
+                        vla_adapter,
+                        state=state,
+                        gripper=gripper,
+                        batch_size=planning_args.vla_batch_size,
+                        action_scaler=planning_args.action_scaler,
+                        gripper_scale=planning_args.gripper_scale,
+                        convert_bridge_to_cosmos=planning_args.convert_bridge_to_cosmos,
+                    )
+                    # Third video: VLA conditioned on world-model generated frame (adapter preprocesses before VLA)
+                    if save_three:
+                        best_actions_gen = generate_vla_actions(
+                            current_initial_gen,  # uint8 (H,W,3); adapter resizes to 224x224, normalizes
+                            task_instruction,
+                            vla_policy,
+                            vla_adapter,
+                            state=state,
+                            gripper=gripper,
+                            batch_size=planning_args.vla_batch_size,
+                            action_scaler=planning_args.action_scaler,
+                            gripper_scale=planning_args.gripper_scale,
+                            convert_bridge_to_cosmos=planning_args.convert_bridge_to_cosmos,
+                        )
+                    elite_costs = []
+                    cem_metrics = {"final_elite_mean": 0.0}
+                else:
+                    best_actions, elite_costs, cem_metrics = cross_entropy_plan(
+                        current_initial_rollout,
+                        goal_image_chunk,
+                        video2world_cli,
+                        chunk_size=planning_args.planning_horizon,
+                        action_dim=action_dim,
+                        cem_iterations=planning_args.cem_iterations,
+                        num_samples=planning_args.num_samples,
+                        num_elite=planning_args.num_elite,
+                        action_std_init=planning_args.action_std_init,
+                        action_bounds_low=planning_args.action_bounds_low,
+                        action_bounds_high=planning_args.action_bounds_high,
+                        cost_type=planning_args.cost_type,
+                        prompt=planning_args.prompt or "",
+                        guidance=planning_args.guidance,
+                        num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
+                        resolution=planning_args.resolution,
+                        negative_prompt=planning_args.negative_prompt,
+                        seed_base=planning_args.seed + chunk_idx * 10000,
+                        progress=True,
+                        episode_bar=chunk_iter if rank0 and hasattr(chunk_iter, "set_postfix") else None,
+                        num_cost_rollouts=planning_args.num_cost_rollouts,
+                    )
+
+                # Execute first chunk_size actions from the planned sequence, then replan
+                actions_to_execute = best_actions[0:effective_chunk_size]
+
+                # Compare executed actions to ground-truth demo actions for this chunk.
+                # NOTE: VLA predicts an open-loop chunk (all actions from same initial frame/state)
+                # while GT is closed-loop (each action from the state after executing previous).
+                # So per-step L2 tends to increase with step index - that's expected.
+                # L2 units: world_model space (action_scaler=20); ~0.5/dim ≈ 2.5cm pos, ~0.025rad rot.
+                gt_start_idx = chunk_idx * effective_chunk_size
+                gt_end_idx = min(gt_start_idx + effective_chunk_size, num_actions)
+                action_l2_per_step: list[float] = []
+                action_l2_mean: float | None = None
+                action_l2_max: float | None = None
+                action_l2_first_step: float | None = None  # Fairest: both from same initial state
+                action_mae_mean: float | None = None  # Mean |error| per element; /20 ≈ physical
+                if gt_start_idx < gt_end_idx:
+                    gt_actions_chunk = demo_actions[gt_start_idx:gt_end_idx]
+                    compare_len = gt_end_idx - gt_start_idx
+                    planned_chunk_for_metric = actions_to_execute[:compare_len]
+                    diffs = planned_chunk_for_metric - gt_actions_chunk
+                    step_l2 = np.linalg.norm(diffs, axis=1)
+                    action_l2_per_step = step_l2.tolist()
+                    action_l2_mean = float(np.mean(step_l2))
+                    action_l2_max = float(np.max(step_l2))
+                    action_l2_first_step = float(step_l2[0])
+                    # Mean abs error across all dims/steps; divide by action_scaler for ~physical units
+                    action_mae_mean = float(np.mean(np.abs(diffs)))
+
+                chunk_metrics_list.append(
+                    {
+                        "chunk_idx": chunk_idx,
+                        "goal_frame_idx": int(goal_frame_idx),
+                        "gt_action_start_idx": int(gt_start_idx),
+                        "gt_action_end_idx": int(gt_end_idx),
+                        "executed_actions": actions_to_execute.tolist(),
+                        "action_l2_per_step": action_l2_per_step,
+                        "action_l2_mean": action_l2_mean,
+                        "action_l2_max": action_l2_max,
+                        "action_l2_first_step": action_l2_first_step,
+                        "action_mae_mean": action_mae_mean,  # ~|error|/dim; /20 for cm/deg
+                        **cem_metrics,
+                    }
                 )
-                best_actions = generate_vla_actions(
-                    current_initial,
-                    task_instruction,
-                    vla_policy,
-                    vla_adapter,
-                    state=state,
-                    gripper=gripper,
-                    batch_size=planning_args.vla_batch_size,
-                    action_scaler=planning_args.action_scaler,
-                    gripper_scale=planning_args.gripper_scale,
-                )
-                elite_costs = []
-                cem_metrics = {"final_elite_mean": 0.0}
-            else:
-                best_actions, elite_costs, cem_metrics = cross_entropy_plan(
-                    current_initial,
-                    goal_image_chunk,
+                # Rollout from GT at chunk boundary (VLA on GT)
+                video_frames_gt, last_frame_gt = rollout_world_model(
                     video2world_cli,
-                    chunk_size=planning_args.planning_horizon,
-                    action_dim=action_dim,
-                    cem_iterations=planning_args.cem_iterations,
-                    num_samples=planning_args.num_samples,
-                    num_elite=planning_args.num_elite,
-                    action_std_init=planning_args.action_std_init,
-                    action_bounds_low=planning_args.action_bounds_low,
-                    action_bounds_high=planning_args.action_bounds_high,
-                    cost_type=planning_args.cost_type,
+                    current_initial_rollout,
+                    actions_to_execute,
                     prompt=planning_args.prompt or "",
                     guidance=planning_args.guidance,
                     num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
                     resolution=planning_args.resolution,
                     negative_prompt=planning_args.negative_prompt,
-                    seed_base=planning_args.seed + chunk_idx * 10000,
-                    progress=True,
-                    episode_bar=chunk_iter if rank0 and hasattr(chunk_iter, "set_postfix") else None,
-                    num_cost_rollouts=planning_args.num_cost_rollouts,
+                    seed=planning_args.seed + 9999 + chunk_idx * 10000,
                 )
-
-            # Execute first chunk_size actions from the planned sequence, then replan
-            actions_to_execute = best_actions[0:effective_chunk_size]
-
-            # Compare executed actions to ground-truth demo actions for this chunk.
-            gt_start_idx = chunk_idx * effective_chunk_size
-            gt_end_idx = min(gt_start_idx + effective_chunk_size, num_actions)
-            action_l2_per_step: list[float] = []
-            action_l2_mean: float | None = None
-            action_l2_max: float | None = None
-            if gt_start_idx < gt_end_idx:
-                gt_actions_chunk = demo_actions[gt_start_idx:gt_end_idx]
-                # Only compare where we have ground-truth actions.
-                compare_len = gt_end_idx - gt_start_idx
-                planned_chunk_for_metric = actions_to_execute[:compare_len]
-                diffs = planned_chunk_for_metric - gt_actions_chunk
-                step_l2 = np.linalg.norm(diffs, axis=1)
-                action_l2_per_step = step_l2.tolist()
-                action_l2_mean = float(np.mean(step_l2))
-                action_l2_max = float(np.max(step_l2))
-
-            chunk_metrics_list.append(
-                {
-                    "chunk_idx": chunk_idx,
-                    "goal_frame_idx": int(goal_frame_idx),
-                    "gt_action_start_idx": int(gt_start_idx),
-                    "gt_action_end_idx": int(gt_end_idx),
-                    "executed_actions": actions_to_execute.tolist(),
-                    "action_l2_per_step": action_l2_per_step,
-                    "action_l2_mean": action_l2_mean,
-                    "action_l2_max": action_l2_max,
-                    **cem_metrics,
-                }
-            )
-            video_frames, last_frame = rollout_world_model(
-                video2world_cli,
-                current_initial,
-                actions_to_execute,
-                prompt=planning_args.prompt or "",
-                guidance=planning_args.guidance,
-                num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
-                resolution=planning_args.resolution,
-                negative_prompt=planning_args.negative_prompt,
-                seed=planning_args.seed + 9999 + chunk_idx * 10000,
-            )
-            chunk_videos.append(video_frames)
-            current_initial = last_frame
-
-            if rank0 and chunk_idx == 0 and num_chunks > 1:
-                # After first chunk, write estimated episode completion time
-                elapsed = time.perf_counter() - episode_start_time
-                if elapsed > 0:
-                    est_total = elapsed * num_chunks
-                    est_remaining = est_total - elapsed
-                    tqdm.write(
-                        f"  Est. episode total: ~{est_total / 60:.1f} min | "
-                        f"remaining: ~{est_remaining / 60:.1f} min"
+                chunk_videos.append(video_frames_gt)
+                if save_three:
+                    actions_gen = best_actions_gen[0:effective_chunk_size]
+                    video_frames_gen, last_frame_gen = rollout_world_model(
+                        video2world_cli,
+                        current_initial_gen,
+                        actions_gen,
+                        prompt=planning_args.prompt or "",
+                        guidance=planning_args.guidance,
+                        num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
+                        resolution=planning_args.resolution,
+                        negative_prompt=planning_args.negative_prompt,
+                        seed=planning_args.seed + 88888 + chunk_idx * 10000,
                     )
+                    chunk_videos_gen.append(video_frames_gen)
+                    current_initial_gen = last_frame_gen
 
-        # Concatenate: first chunk full, later chunks skip first frame to avoid duplicate
-        if len(chunk_videos) == 1:
-            full_video = chunk_videos[0]
-        else:
-            full_video = np.concatenate(
-                [chunk_videos[0]] + [chunk_videos[i][1:] for i in range(1, len(chunk_videos))],
+                # Next chunk: VLA on GT sees GT; VLA on generated sees world-model output; rollout uses GT or generated
+                gt_frame_idx = min((chunk_idx + 1) * effective_chunk_size, len(video_array) - 1)
+                # VLA: original resolution (Bridge adapter does its own resize to 224x224)
+                current_initial_vla = video_array_original[gt_frame_idx]
+                # Rollout: resized for world model
+                next_gt_rollout = video_array[gt_frame_idx]
+                if planning_args.resolution != "none":
+                    try:
+                        h, w = map(int, planning_args.resolution.split(","))
+                        next_gt_rollout = mediapy.resize_image(next_gt_rollout, (h, w))
+                    except Exception:
+                        pass
+                current_initial_rollout = next_gt_rollout if planning_args.use_gt_frames_for_replan else last_frame_gt
+
+                if rank0 and chunk_idx == 0 and num_chunks > 1:
+                    # After first chunk, write estimated episode completion time
+                    elapsed = time.perf_counter() - episode_start_time
+                    if elapsed > 0:
+                        est_total = elapsed * num_chunks
+                        est_remaining = est_total - elapsed
+                        tqdm.write(
+                            f"  Est. episode total: ~{est_total / 60:.1f} min | "
+                            f"remaining: ~{est_remaining / 60:.1f} min"
+                        )
+
+        def _concat_chunks(chunks, skip_gt_frames: bool = False):
+            """Concatenate chunk videos. skip_gt_frames=True omits the first frame of each chunk
+            (the conditional/GT frame) from the output."""
+            if skip_gt_frames:
+                # Don't save GT images: skip first frame of every chunk (the conditional frame)
+                return np.concatenate([chunks[i][1:] for i in range(len(chunks))], axis=0)
+            if len(chunks) == 1:
+                return chunks[0]
+            return np.concatenate(
+                [chunks[0]] + [chunks[i][1:] for i in range(1, len(chunks))],
                 axis=0,
             )
+
+        # Save video(s)
         if rank0:
-            out_path_str = str(out_path.resolve())
-            try:
-                mediapy.write_video(out_path_str, full_video, fps=planning_args.save_fps)
-                tqdm.write(
-                    f"Saved planned video to {out_path_str} ({num_chunks} chunks, {len(full_video)} frames)"
-                )
-                logger.info(
-                    f"Saved planned video to {out_path_str} ({num_chunks} chunks, final elite cost: {chunk_metrics_list[-1]['final_elite_mean']:.6f})"
-                )
-            except Exception as e:
-                logger.exception(f"Failed to save video to {out_path_str}: {e}")
-                tqdm.write(f"ERROR: Failed to save video to {out_path_str}: {e}")
+            videos_to_save = [
+                (chunk_videos, (out_path_gt if (save_both or save_three) else out_path), "planned", False),
+            ]
+            if save_both or save_three:
+                videos_to_save.append((chunk_videos, out_path_no_gt, "planned_no_gt", True))
+            if save_three and chunk_videos_gen is not None:
+                videos_to_save.append((chunk_videos_gen, out_path_gen_vla, "planned_generated_vla", False))
+            for chunks, path, label, skip_gt in videos_to_save:
+                if path.exists():
+                    continue
+                full_video = _concat_chunks(chunks, skip_gt_frames=skip_gt)
+                path_str = str(path.resolve())
+                try:
+                    mediapy.write_video(path_str, full_video, fps=planning_args.save_fps)
+                    tqdm.write(
+                        f"Saved {label} video to {path_str} ({num_chunks} chunks, {len(full_video)} frames)"
+                    )
+                    logger.info(
+                        f"Saved {label} video to {path_str} ({num_chunks} chunks, "
+                        f"final elite cost: {chunk_metrics_list[-1]['final_elite_mean']:.6f})"
+                    )
+                except Exception as e:
+                    logger.exception(f"Failed to save video to {path_str}: {e}")
+                    tqdm.write(f"ERROR: Failed to save video to {path_str}: {e}")
 
             # Save planning metrics to JSON for analysis/plotting
             stats_path = save_root / f"{img_name}_planning_stats.json"
             try:
                 stats = {
                     "img_name": img_name,
+                    "use_gt_frames_for_replan": planning_args.use_gt_frames_for_replan,
+                    "save_both_versions": save_both,
+                    "save_three_versions": save_three,
                     "num_actions": int(num_actions),
                     "planning_horizon": int(planning_args.planning_horizon),
                     "chunk_size": int(planning_args.chunk_size),
                     "num_chunks": int(num_chunks),
-                    "num_frames_planned": int(len(full_video)),
+                    "num_frames_planned": int(len(_concat_chunks(chunk_videos))),
                     "chunks": chunk_metrics_list,
                 }
                 with open(stats_path, "w") as f:

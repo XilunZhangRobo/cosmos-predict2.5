@@ -261,6 +261,7 @@ class Video2WorldInference:
         offload_diffusion_model: bool = False,
         offload_text_encoder: bool = False,
         offload_tokenizer: bool = False,
+        device: str = "cuda:0",
     ):
         """
         Initializes the Video2WorldInference class.
@@ -283,9 +284,10 @@ class Video2WorldInference:
         self.offload_diffusion_model = offload_diffusion_model
         self.offload_text_encoder = offload_text_encoder
         self.offload_tokenizer = offload_tokenizer
+        self.device = device
 
         # If no offloading is specified, instruct model loader to move the model to GPU
-        model_device = None if offload_diffusion_model else "cuda"
+        model_device = None if offload_diffusion_model else device
 
         # Initialize distributed processing if context parallel size > 1
         if self.context_parallel_size > 1:
@@ -322,7 +324,7 @@ class Video2WorldInference:
                 model.conditioner = model.conditioner.to("cpu")
         else:
             # Move everything to the GPU (marginal overhead)
-            model.net.to("cuda")
+            model.net.to(device)
 
         # [On-entry offloading part 2]: Tokenizer
         if self.offload_tokenizer:
@@ -439,14 +441,16 @@ class Video2WorldInference:
                     input_caption_key="ai_caption",
                 )
         else:
-            data_batch["t5_text_embeddings"] = get_text_embedding(prompt)
+            data_batch["t5_text_embeddings"] = get_text_embedding(prompt, device=self.device)
             if use_neg_prompt:
-                data_batch["neg_t5_text_embeddings"] = get_text_embedding(negative_prompt)
+                data_batch["neg_t5_text_embeddings"] = get_text_embedding(negative_prompt, device=self.device)
 
-        # Move tensors to GPU and convert to bfloat16 if they are floating point
+        # Move tensors to device; convert floating point to bfloat16
         for k, v in data_batch.items():
-            if isinstance(v, torch.Tensor) and torch.is_floating_point(data_batch[k]):
-                data_batch[k] = v.cuda().to(dtype=torch.bfloat16)
+            if isinstance(v, torch.Tensor):
+                data_batch[k] = v.to(self.device)
+                if torch.is_floating_point(v):
+                    data_batch[k] = data_batch[k].to(dtype=torch.bfloat16)
 
         return data_batch
 
@@ -552,7 +556,7 @@ class Video2WorldInference:
             use_neg_prompt=True,
         )
 
-        mem_bytes = torch.cuda.memory_allocated(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        mem_bytes = torch.cuda.memory_allocated(device=torch.device(self.device))
         log.info(f"GPU memory usage after getting data_batch: {mem_bytes / (1024**3):.2f} GB")
 
         # Memory Optimization Step 1: Offload Text Encoder
@@ -569,17 +573,17 @@ class Video2WorldInference:
         if self.offload_tokenizer:
             log.info("[Memory Optimization] Loading tokenizer encoder to GPU")
             if hasattr(self.model.tokenizer, "encoder") and self.model.tokenizer.encoder is not None:
-                self.model.tokenizer.encoder = self.model.tokenizer.encoder.to("cuda")
+                self.model.tokenizer.encoder = self.model.tokenizer.encoder.to(self.device)
             torch.cuda.empty_cache()
 
         # Memory Optimization Step 3: Diffusion Network
         # Load the main diffusion network to GPU for sampling
         if self.offload_diffusion_model:
             log.info("[Memory Optimization] Loading diffusion network to GPU")
-            self.model.net = self.model.net.to("cuda")
+            self.model.net = self.model.net.to(self.device)
             # Also load conditioner if it exists
             if hasattr(self.model, "conditioner") and self.model.conditioner is not None:
-                self.model.conditioner = self.model.conditioner.to("cuda")
+                self.model.conditioner = self.model.conditioner.to(self.device)
             torch.cuda.empty_cache()
 
         extra_kwargs = {}
@@ -625,7 +629,7 @@ class Video2WorldInference:
         if self.offload_tokenizer:
             log.info("[Memory Optimization] Loading tokenizer decoder to GPU")
             if hasattr(self.model.tokenizer, "decoder") and self.model.tokenizer.decoder is not None:
-                self.model.tokenizer.decoder = self.model.tokenizer.decoder.to("cuda")
+                self.model.tokenizer.decoder = self.model.tokenizer.decoder.to(self.device)
             torch.cuda.empty_cache()
 
         # Decode the latent samples
@@ -652,7 +656,7 @@ class Video2WorldInference:
             log.info("[Memory Optimization] Load text encoder to GPU")
             # TextEncoder is a wrapper class with self.model (the actual neural network)
             if hasattr(self.model.text_encoder, "model") and self.model.text_encoder.model is not None:
-                self.model.text_encoder.model = self.model.text_encoder.model.to("cuda")
+                self.model.text_encoder.model = self.model.text_encoder.model.to(self.device)
             torch.cuda.empty_cache()
 
         return video
