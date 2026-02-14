@@ -200,6 +200,7 @@ def cross_entropy_plan(
     seed_base: int = 0,
     progress: bool = True,
     episode_bar: tqdm | None = None,
+    num_cost_rollouts: int = 1,
 ) -> tuple[np.ndarray, list[float], dict]:
     """
     Cross-Entropy Method (CEM) to plan an action sequence that minimizes
@@ -225,6 +226,7 @@ def cross_entropy_plan(
         seed_base: Base seed for rollout (each sample gets seed_base + sample_idx).
         progress: If True, show loss updates.
         episode_bar: If provided, update its postfix with CEM iter and losses (single episode bar).
+        num_cost_rollouts: Number of rollouts per action sequence; costs are averaged to reduce variance.
 
     Returns:
         best_actions: (chunk_size, action_dim) best action sequence found.
@@ -246,21 +248,29 @@ def cross_entropy_plan(
 
         costs = np.full(num_samples, np.inf, dtype=np.float64)
         for k in range(num_samples):
-            try:
-                _, last_frame = rollout_world_model(
-                    video2world_cli,
-                    initial_frame,
-                    samples[k],
-                    prompt=prompt,
-                    guidance=guidance,
-                    num_latent_conditional_frames=num_latent_conditional_frames,
-                    resolution=resolution,
-                    negative_prompt=negative_prompt,
-                    seed=seed_base + it * num_samples + k,
-                )
-                costs[k] = goal_image_cost(last_frame, goal_image, cost_type=cost_type)
-            except Exception as e:
-                logger.warning(f"CEM sample {k} rollout failed: {e}")
+            cost_list: list[float] = []
+            for r in range(num_cost_rollouts):
+                try:
+                    _, last_frame = rollout_world_model(
+                        video2world_cli,
+                        initial_frame,
+                        samples[k],
+                        prompt=prompt,
+                        guidance=guidance,
+                        num_latent_conditional_frames=num_latent_conditional_frames,
+                        resolution=resolution,
+                        negative_prompt=negative_prompt,
+                        seed=seed_base
+                        + it * num_samples * num_cost_rollouts
+                        + k * num_cost_rollouts
+                        + r,
+                    )
+                    cost_list.append(goal_image_cost(last_frame, goal_image, cost_type=cost_type))
+                except Exception as e:
+                    logger.warning(f"CEM sample {k} rollout {r} failed: {e}")
+            if cost_list:
+                costs[k] = float(np.mean(cost_list))
+            else:
                 costs[k] = np.inf
 
         # Elite set (lowest cost)
@@ -354,6 +364,30 @@ def run_planning_inference(setup_args, planning_args):
     action_dim = 8 if planning_args.use_quat else 7
     action_load_fn_factory = load_callable(planning_args.action_load_fn)
 
+    # Load VLA policy when using VLA actions
+    vla_policy = None
+    vla_adapter = None
+    if planning_args.use_vla_actions:
+        try:
+            from cosmos_predict2.vla_inference import (
+                get_initial_state_from_json,
+                get_task_instruction_from_json,
+                generate_vla_actions,
+                load_vla_policy,
+            )
+
+            vla_policy, vla_adapter = load_vla_policy(
+                planning_args.vla_checkpoint,
+                n_action_steps=planning_args.vla_n_action_steps,
+                action_ensemble_temp=planning_args.vla_action_ensemble_temp,
+            )
+            logger.info("VLA policy loaded.")
+        except ImportError as e:
+            raise ImportError(
+                "use_vla_actions=True requires PI0 and Bridge adapter. "
+                "Add CoVer_VLA/inference and lerobot to PYTHONPATH. See cosmos_predict2/vla_inference.py docstring."
+            ) from e
+
     annotation_list = input_json_list[planning_args.start : planning_args.end]
     if rank0:
         annotation_list = tqdm(annotation_list, desc="Videos", unit="video")
@@ -384,11 +418,16 @@ def run_planning_inference(setup_args, planning_args):
 
         # Get action length from demo to determine number of chunks
         action_data = action_load_fn_factory()(json_data, video_path, planning_args)
-        num_actions = len(action_data["actions"])
-        num_chunks = (num_actions + planning_args.chunk_size - 1) // planning_args.chunk_size
+        demo_actions = action_data["actions"]
+        num_actions = len(demo_actions)
+        effective_chunk_size = (
+            planning_args.vla_n_action_steps if planning_args.use_vla_actions else planning_args.chunk_size
+        )
+        num_chunks = (num_actions + effective_chunk_size - 1) // effective_chunk_size
         logger.info(
             f"Demo has {num_actions} actions → {num_chunks} chunk(s); "
-            f"planning horizon={planning_args.planning_horizon}, execute chunk_size={planning_args.chunk_size} per replan"
+            f"{'VLA' if planning_args.use_vla_actions else 'CEM'} mode, "
+            f"chunk_size={effective_chunk_size} per replan"
         )
 
         img_name = os.path.basename(annotation_path).replace(".json", "")
@@ -412,6 +451,18 @@ def run_planning_inference(setup_args, planning_args):
             else range(num_chunks)
         )
         episode_start_time = time.perf_counter()
+        task_instruction = None
+        if planning_args.use_vla_actions:
+            from cosmos_predict2.vla_inference import (
+                get_task_instruction_from_json,
+                get_initial_state_from_json,
+            )
+
+            task_instruction = get_task_instruction_from_json(
+                json_data, planning_args.task_instruction
+            )
+            logger.info(f"VLA task instruction: {task_instruction}")
+
         for chunk_idx in chunk_iter:
             # Goal for this chunk = demo frame at end of planning horizon (waypoint)
             goal_frame_idx = min((chunk_idx + 1) * planning_args.planning_horizon, len(video_array) - 1)
@@ -423,38 +474,90 @@ def run_planning_inference(setup_args, planning_args):
                 except Exception:
                     pass
             logger.info(
-                f"Planning for {img_name} chunk {chunk_idx + 1}/{num_chunks} "
+                f"{'VLA' if planning_args.use_vla_actions else 'Planning'} for {img_name} chunk {chunk_idx + 1}/{num_chunks} "
                 f"(goal = demo frame {goal_frame_idx})"
             )
-            best_actions, elite_costs, cem_metrics = cross_entropy_plan(
-                current_initial,
-                goal_image_chunk,
-                video2world_cli,
-                chunk_size=planning_args.planning_horizon,
-                action_dim=action_dim,
-                cem_iterations=planning_args.cem_iterations,
-                num_samples=planning_args.num_samples,
-                num_elite=planning_args.num_elite,
-                action_std_init=planning_args.action_std_init,
-                action_bounds_low=planning_args.action_bounds_low,
-                action_bounds_high=planning_args.action_bounds_high,
-                cost_type=planning_args.cost_type,
-                prompt=planning_args.prompt or "",
-                guidance=planning_args.guidance,
-                num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
-                resolution=planning_args.resolution,
-                negative_prompt=planning_args.negative_prompt,
-                seed_base=planning_args.seed + chunk_idx * 10000,
-                progress=True,
-                episode_bar=chunk_iter if rank0 and hasattr(chunk_iter, "set_postfix") else None,
-            )
-            chunk_metrics_list.append({
-                "chunk_idx": chunk_idx,
-                "goal_frame_idx": int(goal_frame_idx),
-                **cem_metrics,
-            })
+
+            if planning_args.use_vla_actions:
+                # Generate actions from VLA model
+                frame_idx = chunk_idx * effective_chunk_size
+                state, gripper = get_initial_state_from_json(
+                    json_data,
+                    frame_idx=frame_idx,
+                    state_key=planning_args.state_key,
+                    gripper_key=planning_args.gripper_key,
+                )
+                best_actions = generate_vla_actions(
+                    current_initial,
+                    task_instruction,
+                    vla_policy,
+                    vla_adapter,
+                    state=state,
+                    gripper=gripper,
+                    batch_size=planning_args.vla_batch_size,
+                    action_scaler=planning_args.action_scaler,
+                    gripper_scale=planning_args.gripper_scale,
+                )
+                elite_costs = []
+                cem_metrics = {"final_elite_mean": 0.0}
+            else:
+                best_actions, elite_costs, cem_metrics = cross_entropy_plan(
+                    current_initial,
+                    goal_image_chunk,
+                    video2world_cli,
+                    chunk_size=planning_args.planning_horizon,
+                    action_dim=action_dim,
+                    cem_iterations=planning_args.cem_iterations,
+                    num_samples=planning_args.num_samples,
+                    num_elite=planning_args.num_elite,
+                    action_std_init=planning_args.action_std_init,
+                    action_bounds_low=planning_args.action_bounds_low,
+                    action_bounds_high=planning_args.action_bounds_high,
+                    cost_type=planning_args.cost_type,
+                    prompt=planning_args.prompt or "",
+                    guidance=planning_args.guidance,
+                    num_latent_conditional_frames=planning_args.num_latent_conditional_frames,
+                    resolution=planning_args.resolution,
+                    negative_prompt=planning_args.negative_prompt,
+                    seed_base=planning_args.seed + chunk_idx * 10000,
+                    progress=True,
+                    episode_bar=chunk_iter if rank0 and hasattr(chunk_iter, "set_postfix") else None,
+                    num_cost_rollouts=planning_args.num_cost_rollouts,
+                )
+
             # Execute first chunk_size actions from the planned sequence, then replan
-            actions_to_execute = best_actions[0 : planning_args.chunk_size]
+            actions_to_execute = best_actions[0:effective_chunk_size]
+
+            # Compare executed actions to ground-truth demo actions for this chunk.
+            gt_start_idx = chunk_idx * effective_chunk_size
+            gt_end_idx = min(gt_start_idx + effective_chunk_size, num_actions)
+            action_l2_per_step: list[float] = []
+            action_l2_mean: float | None = None
+            action_l2_max: float | None = None
+            if gt_start_idx < gt_end_idx:
+                gt_actions_chunk = demo_actions[gt_start_idx:gt_end_idx]
+                # Only compare where we have ground-truth actions.
+                compare_len = gt_end_idx - gt_start_idx
+                planned_chunk_for_metric = actions_to_execute[:compare_len]
+                diffs = planned_chunk_for_metric - gt_actions_chunk
+                step_l2 = np.linalg.norm(diffs, axis=1)
+                action_l2_per_step = step_l2.tolist()
+                action_l2_mean = float(np.mean(step_l2))
+                action_l2_max = float(np.max(step_l2))
+
+            chunk_metrics_list.append(
+                {
+                    "chunk_idx": chunk_idx,
+                    "goal_frame_idx": int(goal_frame_idx),
+                    "gt_action_start_idx": int(gt_start_idx),
+                    "gt_action_end_idx": int(gt_end_idx),
+                    "executed_actions": actions_to_execute.tolist(),
+                    "action_l2_per_step": action_l2_per_step,
+                    "action_l2_mean": action_l2_mean,
+                    "action_l2_max": action_l2_max,
+                    **cem_metrics,
+                }
+            )
             video_frames, last_frame = rollout_world_model(
                 video2world_cli,
                 current_initial,

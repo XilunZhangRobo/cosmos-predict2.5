@@ -13,12 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-based planning with Cross-Entropy Method (CEM).
+"""Model-based planning with CEM or VLA action generation.
 
 Uses the action-conditioned world model: first frame of each demo video is the
-initial state, last frame is the goal image. CEM plans an action sequence
-that minimizes distance (MSE or L1) from predicted final frame to goal, then
-saves the planned rollout video.
+initial state, last frame is the goal image.
+
+Modes:
+- CEM (default): Cross-Entropy Method plans action sequences that minimize
+  distance from predicted final frame to goal, then saves the planned rollout video.
+- VLA: Use PI0/VLA model to generate action chunks from the initial frame and
+  language instruction. Set use_vla_actions=true and add CoVer_VLA/lerobot to
+  PYTHONPATH. Task instruction comes from JSON (texts[0] or task) or override.
+
+Example with VLA:
+  overrides.use_vla_actions=true overrides.vla_checkpoint=juexzz/INTACT-pi0-finetune-bridge
 """
 
 from pathlib import Path

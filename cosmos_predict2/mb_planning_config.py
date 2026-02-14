@@ -30,8 +30,24 @@ class MBPlanningArguments(ActionConditionedInferenceArguments):
     """Lower bound for clipping actions (scaled space). Run action_conditioned_check_action_range.py to get from data."""
     action_bounds_high: float = 6.0
     """Upper bound for clipping actions (scaled space). Run action_conditioned_check_action_range.py to get from data."""
-    cost_type: str = "feature_l1"
-    """Cost to goal image: 'mse', 'l1', or 'feature_l1' (L1 in encoder feature space, recommended)."""
+    cost_type: str = "mse"
+    """Cost to goal image: 'mse', 'l1', or 'feature_l1' (L1 in encoder feature space; mse/l1 often more stable)."""
+    num_cost_rollouts: int = 2
+    """Number of rollouts per action sequence when evaluating cost; costs are averaged to reduce variance."""
+
+    # VLA (PI0) action generation
+    use_vla_actions: bool = False
+    """If True, use VLA model to generate actions from initial frame instead of CEM planning."""
+    vla_checkpoint: str = "juexzz/INTACT-pi0-finetune-rephrase-bridge"
+    """PI0/VLA model checkpoint (HuggingFace or path)."""
+    vla_batch_size: int = 2
+    """Batch size for VLA inference (more samples = more diverse actions)."""
+    vla_n_action_steps: int = 4
+    """Number of action steps per VLA chunk."""
+    vla_action_ensemble_temp: float = -0.8
+    """Temperature for action ensembling in Bridge adapter."""
+    task_instruction: str | None = None
+    """Override task instruction for VLA. If None, uses json_data['texts'][0] or ['task']."""
 
 
 MBPlanningOverrides = get_overrides_cls(MBPlanningArguments, exclude=["name"])
